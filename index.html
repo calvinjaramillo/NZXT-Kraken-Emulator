@@ -1,0 +1,1055 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Game Boy (WasmBoy)</title>
+  <style>
+    html:has(body .config-container:not(.show)) { overflow: hidden; }
+    html, body { height: 100%; margin: 0; background: #1a1a1a; color: #fff; }
+    body { display: grid; place-items: center; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+
+    /* Square console stage with tiered sizes (320 / 480 / 640) */
+    .console-screen {
+      width: min(320px, 100vmin);
+      height: min(320px, 100vmin);
+      background: #000;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+    }
+    @media (min-width: 480px) and (min-height: 480px) {
+      .console-screen { width: 480px; height: 480px; }
+    }
+    @media (min-width: 640px) and (min-height: 640px) {
+      .console-screen { width: 640px; height: 640px; }
+    }
+    /* The Game Boy canvas scales crisply */
+    #wasmboy-canvas {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      image-rendering: pixelated;
+      image-rendering: -moz-crisp-edges;
+      image-rendering: crisp-edges;
+      background: #000;
+    }
+
+    /* >= 1280x720 (720p+) — preserve GB aspect, no cropping */
+    @media (min-width: 1280px) and (min-height: 720px) {
+      .console-screen {
+        width: auto;
+        height: min(90vh, 1008px); /* up to 7x GB height (7*144=1008) */
+        aspect-ratio: 160 / 144;
+        max-width: none;
+        max-height: none;
+        overflow: visible;
+      }
+      #wasmboy-canvas {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+      }
+    }
+    .gb-status { position: absolute; top: 8px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.6); color: #fff; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; pointer-events: none; }
+
+    /* Config UI */
+    .config-container {
+      display: none;
+      max-width: 720px;
+      width: 92%;
+      background: #2a2a2a;
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+    }
+    .config-container.show { display: block; }
+    .config-title { font-size: 20px; font-weight: 600; margin-bottom: 12px; text-align: center; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: center; margin-bottom: 12px; }
+    .control-label { color: #cbd5e1; font-size: 13px; font-weight: 600; }
+    .text-input, .number-input, .select-input { background: #1f1f1f; color: #eee; border: 1px solid #3a3a3a; border-radius: 8px; padding: 8px 10px; }
+    .text-input { width: 360px; max-width: 92vw; }
+    .btn { background: #383838; color: #fff; border: 1px solid #444; border-radius: 8px; padding: 8px 10px; cursor: pointer; }
+    .btn:hover { background: #424242; }
+    .hint { color: #9aa4af; font-size: 12px; text-align: center; margin-top: 8px; }
+
+    /* Controls popup overlay */
+    .popup-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 9999; }
+    .popup-overlay.show { display: flex; }
+    .popup-window { background: #111; border: 1px solid #333; width: 560px; max-width: 96vw; border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,0.5); overflow: hidden; }
+    .popup-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; background: #1f1f1f; border-bottom: 1px solid #333; color: #e5e7eb; font-weight: 700; }
+    .popup-body { padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: center; }
+    .popup-actions { display: flex; gap: 6px; }
+    .popup-btn { background: #2b2b2b; color: #fff; border: 1px solid #444; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+    .popup-btn:hover { background: #3a3a3a; }
+
+    /* D-Pad layout */
+    .dpad { display: grid; grid-template-columns: 60px 60px 60px; grid-template-rows: 60px 60px 60px; gap: 8px; justify-content: center; }
+    .dpad .spacer { width: 60px; height: 60px; }
+    .gb-btn { display: inline-flex; align-items: center; justify-content: center; width: 60px; height: 60px; background: #2f2f2f; border: 1px solid #444; border-radius: 10px; color: #fff; font-weight: 800; font-size: 18px; user-select: none; cursor: pointer; box-shadow: inset 0 -2px 0 rgba(0,0,0,0.25); }
+    .gb-btn:active { transform: translateY(1px); box-shadow: inset 0 -1px 0 rgba(0,0,0,0.25); }
+
+    /* A/B cluster */
+    .ab-cluster { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; justify-items: center; align-items: center; }
+    .gb-btn.round { width: 70px; height: 70px; border-radius: 50%; font-size: 20px; }
+
+    /* Start/Select */
+    .ss-row { display: flex; gap: 10px; justify-content: center; }
+    .gb-btn.pill { width: 110px; height: 44px; border-radius: 999px; font-size: 14px; letter-spacing: 0.5px; }
+
+    /* Little reopen button (optional) */
+    .reopen-controls { position: fixed; top: 8px; left: 8px; z-index: 20; background: rgba(0,0,0,0.45); border: 1px solid #333; color: #eee; padding: 6px 10px; border-radius: 999px; font-size: 12px; cursor: pointer; display: none; }
+    .reopen-controls.show { display: inline-block; }
+
+    .empty { color: #cbd5e1; font-weight: 600; font-size: 14px; }
+
+    /* Key debug panel */
+    .debug-heading { font-size: 13px; font-weight: 700; color: #cbd5e1; margin: 8px 0 6px; }
+    .debug-log { background: #0f172a; border: 1px solid #334155; color: #e2e8f0; border-radius: 8px; padding: 8px; font: 12px/1.3 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; max-height: 160px; overflow: auto; }
+    .debug-log .line { white-space: pre; }
+  </style>
+  <!-- WasmBoy will be loaded dynamically with CDN fallbacks -->
+</head>
+
+<body>
+  <!-- Configure View (NZXT CAM style) -->
+  <div class="config-container" id="config-container">
+    <div class="config-title">Game Boy — WasmBoy Integration</div>
+    <div class="controls">
+      <div class="control-label">ROM URL</div>
+      <select id="rom-select" class="select-input" title="Select a ROM from /rom/" style="max-width:220px">
+        <option value="" selected>Loading ROMs…</option>
+      </select>
+      <input id="rom-url-input" class="text-input" type="url" placeholder="https://host/path/to/game.gb or .gbc" />
+      <button id="load-rom-btn" class="btn" type="button">Load</button>
+      <button id="add-rom-btn" class="btn" type="button" title="Add current URL to dropdown">Add</button>
+      <button id="refresh-roms-btn" class="btn" type="button" title="Refresh ROM list">Refresh</button>
+      <input id="rom-file-input" class="btn" type="file" accept=".gb,.gbc" />
+      <button id="open-display-btn" class="btn" type="button" title="Open Display">Open Display</button>
+      <button id="show-controls-btn" class="btn" type="button">Show Controls</button>
+      <button id="toggle-inline-controls-btn" class="btn" type="button">Inline Controls</button>
+      <label style="display:inline-flex; align-items:center; gap:6px; color:#cbd5e1; font-size:13px;">
+        <input id="debug-keys-checkbox" type="checkbox" /> Debug Keys
+      </label>
+    </div>
+    <div class="hint">Enter a direct ROM URL (.gb/.gbc). Display view uses <code>?kraken=1</code> and syncs via BroadcastChannel.</div>
+    <div id="debug-keys" style="display:none; margin-top:8px;">
+      <div class="debug-heading">Key Events</div>
+      <div id="debug-log" class="debug-log" aria-live="polite" aria-atomic="false"></div>
+    </div>
+    <div id="inline-controls" style="display:none; margin-top: 12px;">
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items:center; justify-items:center;">
+        <div>
+          <div class="dpad">
+            <div class="spacer"></div>
+            <button class="gb-btn" id="i-btn-up" type="button">▲</button>
+            <div class="spacer"></div>
+            <button class="gb-btn" id="i-btn-left" type="button">◀</button>
+            <div class="spacer"></div>
+            <button class="gb-btn" id="i-btn-right" type="button">▶</button>
+            <div class="spacer"></div>
+            <button class="gb-btn" id="i-btn-down" type="button">▼</button>
+            <div class="spacer"></div>
+          </div>
+        </div>
+        <div>
+          <div class="ab-cluster">
+            <button class="gb-btn round" id="i-btn-b" type="button">B</button>
+            <button class="gb-btn round" id="i-btn-a" type="button">A</button>
+          </div>
+          <div style="height: 12px;"></div>
+          <div class="ss-row">
+            <button class="gb-btn pill" id="i-btn-select" type="button">Select</button>
+            <button class="gb-btn pill" id="i-btn-start" type="button">Start</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Display View -->
+  <div class="console-screen" id="display" style="display:none;">
+    <canvas id="wasmboy-canvas" width="160" height="144" aria-label="Game Boy" tabindex="0"></canvas>
+    <div class="gb-status" id="gb-status" style="display:none;"></div>
+  </div>
+
+  <!-- Reopen controls helper -->
+  <button id="reopen-controls" class="reopen-controls" type="button">Controls</button>
+
+  <!-- Startup Controls Popup -->
+  <div class="popup-overlay" id="controls-popup" aria-hidden="true">
+    <div class="popup-window" role="dialog" aria-modal="true">
+      <div class="popup-header">
+        <span>Game Boy Controls</span>
+        <div class="popup-actions">
+          <button class="popup-btn" id="controls-close" type="button" title="Close">✕</button>
+        </div>
+      </div>
+      <div class="popup-body">
+        <div>
+          <div class="dpad">
+            <div class="spacer"></div>
+            <button class="gb-btn" id="btn-up" type="button">▲</button>
+            <div class="spacer"></div>
+
+            <button class="gb-btn" id="btn-left" type="button">◀</button>
+            <div class="spacer"></div>
+            <button class="gb-btn" id="btn-right" type="button">▶</button>
+
+            <div class="spacer"></div>
+            <button class="gb-btn" id="btn-down" type="button">▼</button>
+            <div class="spacer"></div>
+          </div>
+        </div>
+        <div>
+          <div class="ab-cluster">
+            <button class="gb-btn round" id="btn-b" type="button">B</button>
+            <button class="gb-btn round" id="btn-a" type="button">A</button>
+          </div>
+          <div style="height: 12px;"></div>
+          <div class="ss-row">
+            <button class="gb-btn pill" id="btn-select" type="button">Select</button>
+            <button class="gb-btn pill" id="btn-start" type="button">Start</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Dynamically load WasmBoy with CDN fallbacks to avoid 404s
+    (function loadWasmBoy() {
+      const candidates = [
+        // Local vendor fallback (copy matching files under server/public/vendor/wasmboy)
+        '/static/vendor/wasmboy/wasmboy.wasm.iife.js',
+        '/static/vendor/wasmboy/wasmboy.ts.iife.js',
+        // CDN — version 0.7.1 (as per unpkg directory listing)
+        'https://unpkg.com/wasmboy@0.7.1/dist/wasmboy.wasm.iife.js',
+        'https://cdn.jsdelivr.net/npm/wasmboy@0.7.1/dist/wasmboy.wasm.iife.js',
+        // CDN — newer version fallback
+        'https://unpkg.com/wasmboy@7.2.0/dist/wasmboy.wasm.iife.js',
+        'https://cdn.jsdelivr.net/npm/wasmboy@7.2.0/dist/wasmboy.wasm.iife.js',
+        // UMD variants as last resort
+        'https://unpkg.com/wasmboy@0.7.1/dist/wasmboy.wasm.umd.js',
+        'https://cdn.jsdelivr.net/npm/wasmboy@0.7.1/dist/wasmboy.wasm.umd.js'
+      ];
+      function tryLoad(i) {
+        if (i >= candidates.length) return;
+        const s = document.createElement('script');
+        s.src = candidates[i];
+        // Load after DOM is ready so the library can locate the canvas
+        s.async = false;
+        s.defer = true;
+        s.onload = () => { /* loaded */ };
+        s.onerror = () => { tryLoad(i + 1); };
+        document.head.appendChild(s);
+      }
+      function start() { tryLoad(0); }
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
+    })();
+  </script>
+  <script>
+    const APP_VERSION = '0.1.0';
+    const CHANNEL_NAME = 'gb-sync';
+    const STORAGE_ROM_URL_KEY = 'gb-rom-url';
+    const STORAGE_AUDIO_KEY = 'gb-audio-enabled';
+    const STORAGE_SAVE_PREFIX = 'gb-save-';
+    const SAVE_INTERVAL_MS = 60 * 1000; // 1 minute
+    const DEFAULT_ROM_URL = '/static/red.gb';
+
+    let channel = null;
+    let romUrl = '';
+    let audioEnabled = true;
+    let isDisplay = false;
+    let isControlsOnly = false;
+    let hasShownPopup = false;
+
+    function getCanvasEl() { return document.getElementById('wasmboy-canvas'); }
+
+    function resolveWasmBoy() {
+      const candidates = [
+        window.WasmBoy,
+        window.wasmboy,
+        window.WasmBoy && window.WasmBoy.WasmBoy,
+        window.WasmBoy && window.WasmBoy.default,
+        window.WasmBoyLib,
+        window.WasmBoyModule
+      ];
+      for (const c of candidates) {
+        if (c && (typeof c === 'object' || typeof c === 'function')) return c;
+      }
+      return null;
+    }
+
+    function ensureWasmBoyInstance(WB) {
+      if (window.__gbEmu && (typeof window.__gbEmu === 'object')) return window.__gbEmu;
+      let emu = null;
+      try {
+        if (WB && typeof WB === 'object') {
+          // Some builds expose a singleton object already
+          emu = WB;
+        } else if (WB && typeof WB === 'function') {
+          // Class/constructor style
+          emu = new WB();
+        }
+      } catch (e) {}
+      if (emu) window.__gbEmu = emu;
+      return emu;
+    }
+
+    async function maybeInitConfig(emu, canvas) {
+      const cfg = { canvas, graphics: { canvas }, isGbcEnabled: true, isAudioEnabled: !!audioEnabled, isSkipBoot: true };
+      if (!emu) return;
+      try {
+        // Prefer passing canvas explicitly to config so internal initialize gets a real element
+        if (typeof emu.config === 'function') {
+          await emu.config(cfg, canvas);
+        } else if (typeof emu.setConfig === 'function') {
+          await emu.setConfig(cfg);
+        }
+        if (typeof emu.setCanvas === 'function') {
+          try { await emu.setCanvas(canvas); } catch (e) {}
+        } else if ('canvas' in emu) {
+          try { emu.canvas = canvas; } catch (e) {}
+        }
+        // Some builds expose selector-based setters
+        if (typeof emu.setCanvasSelector === 'function') {
+          try { emu.setCanvasSelector('#wasmboy-canvas'); } catch (e) {}
+        }
+        if (typeof emu.setCanvasElement === 'function') {
+          try { emu.setCanvasElement(canvas); } catch (e) {}
+        }
+        // Ensure any global hook also points to our canvas
+        try { window.WasmBoyCanvas = canvas; } catch (e) {}
+      } catch (e) {}
+    }
+
+    async function callAny(obj, names, args) {
+      for (const n of names) {
+        const fn = obj && obj[n];
+        if (typeof fn === 'function') {
+          return await fn.apply(obj, args);
+        }
+      }
+      throw new Error(names[0] + ' not found');
+    }
+
+    function collectCandidates(WB) {
+      const out = [];
+      const push = (v) => { if (v && !out.includes(v)) out.push(v); };
+      const parts = [
+        WB,
+        WB && WB.WasmBoy,
+        WB && WB.default,
+        WB && WB.wasmBoy,
+        WB && WB.WasmBoyLib,
+        WB && WB.WasmBoyModule,
+        WB && WB.Module,
+        window && window.wasmBoy,
+        window && window.WasmBoy,
+        window && window.WasmBoy && window.WasmBoy.default,
+      ];
+      parts.forEach(push);
+      // Flatten one more common nesting level
+      const more = [];
+      out.forEach((v) => {
+        if (v && typeof v === 'object') {
+          ['default', 'WasmBoy', 'wasmBoy', 'Module'].forEach((k) => {
+            try { if (v[k]) more.push(v[k]); } catch (e) {}
+          });
+        }
+      });
+      more.forEach(push);
+      return out;
+    }
+
+    function isDisplayMode() {
+      const params = new URLSearchParams(window.location.search);
+      const kraken = (params.get('kraken') || '').toLowerCase();
+      return kraken === '1' || kraken === 'true';
+    }
+
+    function isControlsOnlyMode() {
+      const params = new URLSearchParams(window.location.search);
+      const c = (params.get('controls') || '').toLowerCase();
+      return c === '1' || c === 'true';
+    }
+
+    function openChannel() {
+      if ('BroadcastChannel' in window) {
+        try { if (!channel) channel = new BroadcastChannel(CHANNEL_NAME); } catch (e) {}
+      }
+    }
+
+    function synthesizeKey(code, key, type) {
+      const evOpts = { code, key, bubbles: true, cancelable: true };
+      try {
+        window.__gbSynthesizing = (Number(window.__gbSynthesizing) || 0) + 1;
+        const ev = new KeyboardEvent(type, evOpts);
+        document.dispatchEvent(ev);
+        window.dispatchEvent(ev);
+      } catch (e) {}
+      finally {
+        try { window.__gbSynthesizing = Math.max(0, (Number(window.__gbSynthesizing) || 1) - 1); } catch (e) { window.__gbSynthesizing = 0; }
+      }
+    }
+
+    function postControlMessage(code, key, down) {
+      openChannel();
+      if (!channel) return;
+      try { channel.postMessage({ type: 'control', code, key, down: !!down }); } catch (e) {}
+    }
+
+    function openControlsWindow() {
+      const url = new URL(window.location.href);
+      url.searchParams.set('controls', '1');
+      url.searchParams.delete('kraken');
+      const features = 'width=420,height=520,menubar=0,toolbar=0,location=0,status=0,resizable=1,scrollbars=0';
+      window.open(url.toString(), 'gb-controls', features);
+    }
+
+    function showDisplay() {
+      document.getElementById('config-container').classList.remove('show');
+      document.getElementById('display').style.display = 'grid';
+      document.getElementById('reopen-controls').classList.add('show');
+      // Try to focus the canvas for immediate keyboard input
+      try { const c = getCanvasEl(); if (c) c.focus(); } catch (e) {}
+    }
+
+    function showConfig() {
+      document.getElementById('config-container').classList.add('show');
+      document.getElementById('display').style.display = 'none';
+      document.getElementById('reopen-controls').classList.remove('show');
+    }
+
+    function loadPersisted() {
+      try {
+        const u = localStorage.getItem(STORAGE_ROM_URL_KEY);
+        if (typeof u === 'string') romUrl = u.trim();
+      } catch (e) {}
+      try {
+        const a = localStorage.getItem(STORAGE_AUDIO_KEY);
+        audioEnabled = (a == null) ? true : (String(a) !== '0');
+      } catch (e) { audioEnabled = true; }
+    }
+
+    function persistRomUrl() {
+      try { localStorage.setItem(STORAGE_ROM_URL_KEY, String(romUrl || '')); } catch (e) {}
+    }
+
+    function getSaveKeyForCurrentRom() {
+      let key = STORAGE_SAVE_PREFIX + (romUrl || '');
+      try { key = STORAGE_SAVE_PREFIX + btoa(unescape(encodeURIComponent(romUrl || ''))); } catch (e) {}
+      return key;
+    }
+
+    function cloneSaveStateForStorage(state) {
+      try {
+        if (!state || typeof state !== 'object') return null;
+        const copy = JSON.parse(JSON.stringify(state, (k, v) => {
+          if (v && typeof v === 'object' && v.buffer instanceof ArrayBuffer && typeof v.BYTES_PER_ELEMENT === 'number') {
+            return Array.from(v);
+          }
+          return v;
+        }));
+        if (copy && copy.wasmboyMemory && typeof copy.wasmboyMemory === 'object') {
+          Object.keys(copy.wasmboyMemory).forEach((m) => {
+            const val = copy.wasmboyMemory[m];
+            if (val && typeof val === 'object' && val.buffer instanceof ArrayBuffer) {
+              try { copy.wasmboyMemory[m] = Array.from(val); } catch (e) {}
+            }
+          });
+        }
+        return copy;
+      } catch (e) { return null; }
+    }
+
+    function reviveSaveStateFromStorage(raw) {
+      if (!raw || typeof raw !== 'object') return null;
+      const obj = raw.state || raw;
+      try {
+        if (obj && obj.wasmboyMemory && typeof obj.wasmboyMemory === 'object') {
+          Object.keys(obj.wasmboyMemory).forEach((k) => {
+            const v = obj.wasmboyMemory[k];
+            if (Array.isArray(v)) {
+              obj.wasmboyMemory[k] = new Uint8Array(v);
+            }
+          });
+        }
+      } catch (e) {}
+      return obj;
+    }
+
+    async function autoSaveNow(target) {
+      const statusEl = document.getElementById('gb-status');
+      try {
+        const WB = resolveWasmBoy();
+        const emu = ensureWasmBoyInstance(WB);
+        const holder = target || emu || WB;
+        if (!holder) return;
+        const save = await callAny(holder, ['saveState'], []);
+        const safe = cloneSaveStateForStorage(save);
+        if (!safe) return;
+        const payload = { version: 1, savedAt: Date.now(), state: safe };
+        try { localStorage.setItem(getSaveKeyForCurrentRom(), JSON.stringify(payload)); } catch (e) {}
+        if (statusEl) { statusEl.style.display = 'inline-block'; statusEl.textContent = 'Saved'; setTimeout(() => { try { statusEl.style.display = 'none'; statusEl.textContent = ''; } catch (e) {} }, 1000); }
+      } catch (e) {}
+    }
+
+    async function maybeLoadAutoSave(target) {
+      try {
+        const raw = localStorage.getItem(getSaveKeyForCurrentRom());
+        if (!raw) return false;
+        let parsed = null;
+        try { parsed = JSON.parse(raw); } catch (e) { return false; }
+        const state = reviveSaveStateFromStorage(parsed);
+        if (!state) return false;
+        await callAny(target, ['loadState'], [state]);
+        return true;
+      } catch (e) { return false; }
+    }
+
+    function scheduleAutoSave(target) {
+      try { if (window.__gbAutoSaveInterval) { clearInterval(window.__gbAutoSaveInterval); window.__gbAutoSaveInterval = null; } } catch (e) {}
+      window.__gbAutoSaveInterval = setInterval(() => { autoSaveNow(target); }, SAVE_INTERVAL_MS);
+      try { document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') autoSaveNow(target); }, { capture: true }); } catch (e) {}
+      try { window.addEventListener('beforeunload', () => { autoSaveNow(target); }, { capture: true }); } catch (e) {}
+    }
+
+    function getRomFromParams() {
+      const params = new URLSearchParams(window.location.search);
+      const u = (params.get('rom') || '').trim();
+      return u || '';
+    }
+
+    async function initAndPlay(romHref) {
+      const canvas = getCanvasEl();
+      const statusEl = document.getElementById('gb-status');
+      if (!canvas) return;
+      let WB = resolveWasmBoy();
+      if (!WB) {
+        // Wait briefly for the script to finish loading
+        await new Promise(r => setTimeout(r, 250));
+        WB = resolveWasmBoy();
+        if (!WB) { console.warn('WasmBoy not loaded yet.'); return; }
+      }
+      const emu = ensureWasmBoyInstance(WB);
+
+      try {
+        const url = String(romHref || '').trim();
+        if (!url) {
+          console.warn('No ROM URL provided.');
+          return;
+        }
+        if (statusEl) { statusEl.style.display = 'inline-block'; statusEl.textContent = 'Loading ROM…'; }
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) throw new Error('Failed to fetch ROM');
+        const romBuffer = await res.arrayBuffer();
+        const romBytes = new Uint8Array(romBuffer);
+
+        const loadNames = ['loadROM', 'loadRom', 'loadROMFromArrayBuffer', 'loadRomFromArrayBuffer', 'loadROMFromBuffer', 'loadRomFromBuffer', 'loadROMU8', 'loadROMFromURL', 'loadRomFromURL', 'loadROMFromUrl', 'loadRomFromUrl'];
+        const playNames = ['play', 'resume', 'start'];
+        // Identify the target that actually has the load method
+        let target = emu || WB;
+        const cands = collectCandidates(WB).concat(collectCandidates(emu));
+        for (const cand of cands) {
+          if (!cand) continue;
+          for (const name of loadNames) {
+            if (typeof cand[name] === 'function') { target = cand; break; }
+          }
+        }
+        // Ensure canvas/config is applied to the same target we will load/play on
+        await maybeInitConfig(target, canvas);
+        // Try Uint8Array first, then ArrayBuffer if needed
+        try {
+          await callAny(target, loadNames, [romBytes]);
+        } catch (e) {
+          await callAny(target, loadNames, [romBytes.buffer]);
+        }
+        try { await maybeLoadAutoSave(target); } catch (e) {}
+        await callAny(target, playNames, []);
+        scheduleAutoSave(target);
+        if (statusEl) { statusEl.textContent = ''; statusEl.style.display = 'none'; }
+        try { canvas.focus(); } catch (e) {}
+      } catch (err) {
+        console.error('Failed to start WasmBoy:', err);
+        if (statusEl) {
+          statusEl.style.display = 'inline-block';
+          statusEl.textContent = 'Load failed: ' + (err && err.message ? err.message : 'Unknown error');
+        }
+      }
+    }
+
+    function setupConfigUI() {
+      const input = document.getElementById('rom-url-input');
+      const loadBtn = document.getElementById('load-rom-btn');
+      const openBtn = document.getElementById('open-display-btn');
+      const showControlsBtn = document.getElementById('show-controls-btn');
+      const toggleInlineBtn = document.getElementById('toggle-inline-controls-btn');
+      const inlineControls = document.getElementById('inline-controls');
+      const debugCb = document.getElementById('debug-keys-checkbox');
+      const debugWrap = document.getElementById('debug-keys');
+      const romSelect = document.getElementById('rom-select');
+      const addRomBtn = document.getElementById('add-rom-btn');
+      const refreshRomsBtn = document.getElementById('refresh-roms-btn');
+      const fileInput = document.getElementById('rom-file-input');
+      if (input) input.value = romUrl || '';
+      if (loadBtn) {
+        loadBtn.addEventListener('click', () => {
+          const val = (input && input.value) ? input.value.trim() : '';
+          if (!val) return;
+          romUrl = val;
+          persistRomUrl();
+          // Quick local preview (config view)
+          initAndPlay(romUrl);
+          // Broadcast to display views
+          openChannel();
+          if (channel) { try { channel.postMessage({ romUrl }); } catch (e) {} }
+        });
+      }
+      if (openBtn) {
+        openBtn.addEventListener('click', () => {
+          const url = new URL(window.location.href);
+          url.searchParams.set('kraken', '1');
+          if (input && input.value) url.searchParams.set('rom', input.value.trim());
+          window.open(url.toString(), '_blank');
+        });
+      }
+      if (romSelect) {
+        romSelect.addEventListener('change', () => {
+          const val = romSelect.value || '';
+          if (!val) return;
+          if (input) input.value = val;
+          romUrl = val;
+          persistRomUrl();
+          initAndPlay(romUrl);
+          openChannel();
+          if (channel) { try { channel.postMessage({ romUrl }); } catch (e) {} }
+        });
+      }
+      if (addRomBtn) {
+        addRomBtn.addEventListener('click', () => {
+          const val = (input && input.value ? input.value.trim() : '');
+          if (!val) return;
+          addCustomRom(val);
+          populateRomSelect();
+        });
+      }
+      if (refreshRomsBtn) {
+        refreshRomsBtn.addEventListener('click', () => populateRomSelect());
+      }
+      if (showControlsBtn && inlineControls) {
+        showControlsBtn.addEventListener('click', () => {
+          const isOpen = inlineControls.style.display !== 'none';
+          inlineControls.style.display = isOpen ? 'none' : 'block';
+          try { showControlsBtn.textContent = isOpen ? 'Show Controls' : 'Hide Controls'; } catch (e) {}
+          if (!isOpen) bindInlineControls();
+        });
+      }
+      if (toggleInlineBtn && inlineControls) {
+        toggleInlineBtn.addEventListener('click', () => {
+          const isOpen = inlineControls.style.display !== 'none';
+          inlineControls.style.display = isOpen ? 'none' : 'block';
+          try { toggleInlineBtn.textContent = isOpen ? 'Inline Controls' : 'Hide Inline Controls'; } catch (e) {}
+          if (!isOpen) bindInlineControls();
+        });
+      }
+      if (debugCb && debugWrap) {
+        debugCb.addEventListener('change', () => {
+          const on = !!debugCb.checked;
+          debugWrap.style.display = on ? 'block' : 'none';
+          window.__gbKeyDebugEnabled = on;
+        });
+      }
+      if (fileInput) {
+        fileInput.addEventListener('change', async () => {
+          const f = fileInput.files && fileInput.files[0];
+          if (!f) return;
+          try {
+            const buf = await f.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            // Configure and load directly for local preview
+            const canvas = getCanvasEl();
+            let WB = resolveWasmBoy();
+            if (!WB) { await new Promise(r => setTimeout(r, 250)); WB = resolveWasmBoy(); }
+            const emu = ensureWasmBoyInstance(WB);
+            if ((emu || WB) && canvas) {
+              await maybeInitConfig(emu || WB, canvas);
+              const loadNames = ['loadROM', 'loadRom', 'loadROMFromArrayBuffer', 'loadRomFromArrayBuffer', 'loadROMFromBuffer', 'loadRomFromBuffer', 'loadROMU8', 'loadROMFromURL', 'loadRomFromURL', 'loadROMFromUrl', 'loadRomFromUrl'];
+              const playNames = ['play', 'resume', 'start'];
+              let target = emu || WB;
+              const cands = collectCandidates(WB).concat(collectCandidates(emu));
+              for (const cand of cands) {
+                if (!cand) continue;
+                for (const name of loadNames) {
+                  if (typeof cand[name] === 'function') { target = cand; break; }
+                }
+              }
+              try { await callAny(target, loadNames, [bytes]); } catch (e) { await callAny(target, loadNames, [bytes.buffer]); }
+              try { romUrl = 'file:' + (f && f.name ? f.name : 'local'); } catch (e) {}
+              try { await maybeLoadAutoSave(target); } catch (e) {}
+              await callAny(target, playNames, []);
+              scheduleAutoSave(target);
+            }
+          } catch (e) {
+            console.error('Failed to load local ROM file', e);
+          }
+        });
+      }
+      // Populate ROM dropdown
+      populateRomSelect();
+    }
+
+    async function populateRomSelect() {
+      const select = document.getElementById('rom-select');
+      if (!select) return;
+      select.disabled = true;
+      select.innerHTML = '<option value="">Loading ROMs…</option>';
+      const discovered = await discoverRomFiles();
+      const custom = getCustomRoms();
+      // Merge and de-dupe by url
+      const seen = new Set();
+      const roms = [];
+      [...custom, ...discovered].forEach(r => {
+        if (!r || !r.url) return;
+        if (seen.has(r.url)) return;
+        seen.add(r.url);
+        roms.push({ label: r.label || (r.url.split('/').pop() || r.url), url: r.url });
+      });
+      if (!roms || roms.length === 0) {
+        select.innerHTML = '<option value="">No ROMs found in /rom</option>';
+        select.disabled = false;
+        return;
+      }
+      const opts = roms.map(r => `<option value="${r.url}">${r.label}</option>`).join('');
+      select.innerHTML = '<option value="">Select ROM…</option>' + opts;
+      // Preselect persisted url if present
+      try { if (romUrl) select.value = romUrl; } catch (e) {}
+      select.disabled = false;
+    }
+
+    function getCustomRoms() {
+      try {
+        const raw = localStorage.getItem('gb-custom-roms');
+        const arr = raw ? JSON.parse(raw) : [];
+        if (!Array.isArray(arr)) return [];
+        return arr.map(u => ({ label: (u.split('/').pop() || u), url: u }));
+      } catch (e) { return []; }
+    }
+
+    function addCustomRom(url) {
+      try {
+        const raw = localStorage.getItem('gb-custom-roms');
+        const arr = raw ? JSON.parse(raw) : [];
+        if (!arr.includes(url)) arr.unshift(url);
+        localStorage.setItem('gb-custom-roms', JSON.stringify(arr.slice(0, 100)));
+      } catch (e) {}
+    }
+
+    async function discoverRomFiles() {
+      // HTML-only: attempt to parse directory listings under likely folders
+      const bases = ['/rom/', '/static/rom/', '/roms/', '/static/roms/', '/static/', '/'];
+      const exts = ['.gb', '.gbc', '.zip'];
+      const seen = new Set();
+      const out = [];
+      async function tryJson(url) {
+        try {
+          const res = await fetch(url, { cache: 'no-store' });
+          if (!res.ok) return null;
+          const ct = (res.headers.get('Content-Type') || '').toLowerCase();
+          if (!ct.includes('application/json') && !url.endsWith('.json')) return null;
+          return await res.json();
+        } catch (e) { return null; }
+      }
+      function push(base, href) {
+        if (!href) return;
+        let lower = href.toLowerCase();
+        // If directory listing provides just a name, normalize against base
+        let url = href.startsWith('http') || href.startsWith('/') ? href : (base + href);
+        // Strip query/hash for extension check
+        try { lower = url.split('?')[0].split('#')[0].toLowerCase(); } catch (e) {}
+        if (!exts.some(ext => lower.endsWith(ext))) return;
+        const key = url;
+        if (seen.has(key)) return;
+        seen.add(key);
+        const name = decodeURIComponent((url.split('?')[0].split('#')[0].split('/').pop()) || 'ROM');
+        const label = name;
+        out.push({ label, url });
+      }
+      for (const base of bases) {
+        // JSON manifests
+        const candidates = ['manifest.json', 'index.json', 'roms.json'].map(p => base + p);
+        for (const j of candidates) {
+          const data = await tryJson(j);
+          if (Array.isArray(data)) {
+            data.forEach(item => {
+              if (typeof item === 'string') push(base, item);
+              else if (item && typeof item === 'object') push(base, item.url || item.path || '');
+            });
+          } else if (data && typeof data === 'object' && Array.isArray(data.roms)) {
+            data.roms.forEach(item => {
+              if (typeof item === 'string') push(base, item);
+              else if (item && typeof item === 'object') push(base, item.url || item.path || '');
+            });
+          }
+          if (out.length) break;
+        }
+        if (out.length) break;
+        // Directory listing fallback
+        try {
+          const res = await fetch(base, { cache: 'no-store' });
+          if (res.ok) {
+            const text = await res.text();
+            const doc = new DOMParser().parseFromString(text, 'text/html');
+            const anchors = Array.from(doc.querySelectorAll('a[href]'));
+            anchors.forEach(a => push(base, a.getAttribute('href')));
+            if (out.length) break;
+          }
+        } catch (e) {}
+      }
+      // Always include known default as a convenience
+      try {
+        if (DEFAULT_ROM_URL && !seen.has(DEFAULT_ROM_URL)) {
+          out.unshift({ label: (DEFAULT_ROM_URL.split('/').pop() || 'red.gb'), url: DEFAULT_ROM_URL });
+          seen.add(DEFAULT_ROM_URL);
+        }
+      } catch (e) {}
+      // Sort by label
+      out.sort((a, b) => a.label.localeCompare(b.label));
+      return out;
+    }
+
+    function bindInlineControls() {
+      const root = document.getElementById('inline-controls');
+      if (!root || root.__bound) return; // bind once
+      root.__bound = true;
+      const map = {
+        'i-btn-up':   { code: 'ArrowUp',    key: 'ArrowUp' },
+        'i-btn-down': { code: 'ArrowDown',  key: 'ArrowDown' },
+        'i-btn-left': { code: 'ArrowLeft',  key: 'ArrowLeft' },
+        'i-btn-right':{ code: 'ArrowRight', key: 'ArrowRight' },
+        'i-btn-a':    { code: 'KeyX',       key: 'x' },
+        'i-btn-b':    { code: 'KeyZ',       key: 'z' },
+        'i-btn-start':{ code: 'Enter',      key: 'Enter' },
+        'i-btn-select':{ code: 'ShiftLeft', key: 'Shift' }
+      };
+      function bind(id) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const { code, key } = map[id];
+        const down = () => { postControlMessage(code, key, true); };
+        const up = () => { postControlMessage(code, key, false); };
+        el.addEventListener('pointerdown', (e) => { e.preventDefault(); down(); });
+        el.addEventListener('pointerup', (e) => { e.preventDefault(); up(); });
+        el.addEventListener('pointercancel', (e) => { e.preventDefault(); up(); });
+        el.addEventListener('pointerleave', (e) => { e.preventDefault(); up(); });
+        el.addEventListener('touchstart', (e) => { e.preventDefault(); down(); }, { passive: false });
+        el.addEventListener('touchend', (e) => { e.preventDefault(); up(); }, { passive: false });
+      }
+      Object.keys(map).forEach(bind);
+    }
+
+    function showControlsPopup() {
+      const overlay = document.getElementById('controls-popup');
+      if (!overlay) return;
+      overlay.classList.add('show');
+      overlay.setAttribute('aria-hidden', 'false');
+      hasShownPopup = true;
+    }
+
+    function hideControlsPopup() {
+      const overlay = document.getElementById('controls-popup');
+      if (!overlay) return;
+      overlay.classList.remove('show');
+      overlay.setAttribute('aria-hidden', 'true');
+    }
+
+    function bindPopupControls() {
+      const overlay = document.getElementById('controls-popup');
+      const close = document.getElementById('controls-close');
+      const reopen = document.getElementById('reopen-controls');
+      if (close) close.addEventListener('click', hideControlsPopup);
+      if (overlay) overlay.addEventListener('click', (ev) => { if (ev.target === overlay) hideControlsPopup(); });
+      if (reopen) reopen.addEventListener('click', openControlsWindow);
+
+      const map = {
+        'btn-up':   { code: 'ArrowUp',    key: 'ArrowUp' },
+        'btn-down': { code: 'ArrowDown',  key: 'ArrowDown' },
+        'btn-left': { code: 'ArrowLeft',  key: 'ArrowLeft' },
+        'btn-right':{ code: 'ArrowRight', key: 'ArrowRight' },
+        // WasmBoy default keyboard mapping: A=KeyX, B=KeyZ
+        'btn-a':    { code: 'KeyX',       key: 'x' },
+        'btn-b':    { code: 'KeyZ',       key: 'z' },
+        'btn-start':{ code: 'Enter',      key: 'Enter' },
+        // Prefer a specific shift side; library accepts ShiftLeft/ShiftRight
+        'btn-select':{ code: 'ShiftLeft', key: 'Shift' }
+      };
+
+      function dispatchKey(code, key, type) {
+        if (isControlsOnly) {
+          postControlMessage(code, key, type === 'keydown');
+        } else {
+          synthesizeKey(code, key, type);
+        }
+      }
+
+      function bindBtn(id) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const canvas = getCanvasEl();
+        const { code, key } = map[id];
+        const down = () => {
+          if (canvas) { try { canvas.focus(); } catch (e) {} }
+          dispatchKey(code, key, 'keydown');
+        };
+        const up = () => { dispatchKey(code, key, 'keyup'); };
+        el.addEventListener('pointerdown', (e) => { e.preventDefault(); down(); });
+        el.addEventListener('pointerup', (e) => { e.preventDefault(); up(); });
+        el.addEventListener('pointercancel', (e) => { e.preventDefault(); up(); });
+        el.addEventListener('pointerleave', (e) => { e.preventDefault(); up(); });
+        // Touch compatibility
+        el.addEventListener('touchstart', (e) => { e.preventDefault(); down(); }, { passive: false });
+        el.addEventListener('touchend', (e) => { e.preventDefault(); up(); }, { passive: false });
+      }
+
+      Object.keys(map).forEach(bindBtn);
+    }
+
+    function bindKeyboardShortcuts() {
+      if (window.__gbKeysBound) return; // bind once
+      window.__gbKeysBound = true;
+
+      function isTypingTarget(target) {
+        if (!target) return false;
+        const tag = (target.tagName || '').toLowerCase();
+        if (['input', 'textarea', 'select', 'option', 'optgroup', 'label'].includes(tag)) return true;
+        try { if (target.isContentEditable) return true; } catch (e) {}
+        return false;
+      }
+
+      function logEvent(ev, isDown, code, outKey, note) {
+        if (!window.__gbKeyDebugEnabled) return;
+        const logEl = document.getElementById('debug-log');
+        if (!logEl) return;
+        const when = new Date().toLocaleTimeString();
+        const line = document.createElement('div');
+        line.className = 'line';
+        line.textContent = `${when} ${isDown ? '↓' : '↑'} key='${ev.key}' code='${ev.code}' → emit code='${code}' key='${outKey}'${note ? ' (' + note + ')' : ''}`;
+        logEl.appendChild(line);
+        try { logEl.scrollTop = logEl.scrollHeight; } catch (e) {}
+      }
+
+      function handle(ev, isDown) {
+        // Ignore synthetic events we dispatched to avoid recursion
+        try { if (!ev.isTrusted) return; } catch (e) {}
+        try { if ((Number(window.__gbSynthesizing) || 0) > 0) return; } catch (e) {}
+        const t = ev.target;
+        if (isTypingTarget(t)) return; // don't intercept while typing
+
+        const key = String(ev.key || '');
+        const k = key.toLowerCase();
+        const isDisplayHere = !!isDisplay;
+
+        // Helper to emit to correct target
+        function emit(code, outKey, note) {
+          // Block original to avoid WasmBoy handling conflicting keys (z/x)
+          try { ev.preventDefault(); ev.stopPropagation(); if (ev.stopImmediatePropagation) ev.stopImmediatePropagation(); } catch (e) {}
+          if (isDisplayHere) {
+            synthesizeKey(code, outKey, isDown ? 'keydown' : 'keyup');
+          } else {
+            postControlMessage(code, outKey, isDown);
+          }
+          logEvent(ev, isDown, code, outKey, note);
+        }
+
+        // Arrow keys: forward only when NOT in display (controls/config windows)
+        if (!isDisplayHere && (key === 'ArrowUp' || key === 'ArrowDown' || key === 'ArrowLeft' || key === 'ArrowRight')) {
+          emit(key, key, 'arrow passthrough');
+          return;
+        }
+
+        // WASD -> Arrow keys (both display and non-display)
+        if (k === 'w') { emit('ArrowUp', 'ArrowUp', 'W→Up'); return; }
+        if (k === 'a') { emit('ArrowLeft', 'ArrowLeft', 'A→Left'); return; }
+        if (k === 's') { emit('ArrowDown', 'ArrowDown', 'S→Down'); return; }
+        if (k === 'd') { emit('ArrowRight', 'ArrowRight', 'D→Right'); return; }
+
+        // A button: z or j -> KeyX ('x')
+        if (k === 'z' || k === 'j') { emit('KeyX', 'x', 'A button'); return; }
+
+        // B button: x or k -> KeyZ ('z')
+        if (k === 'x' || k === 'k') { emit('KeyZ', 'z', 'B button'); return; }
+
+        // Select: '.' -> ShiftLeft ('Shift')
+        if (key === '.') { emit('ShiftLeft', 'Shift', 'Select'); return; }
+
+        // Start: '?' -> Enter ('Enter')
+        if (key === '?') { emit('Enter', 'Enter', 'Start'); return; }
+      }
+
+      document.addEventListener('keydown', (e) => handle(e, true), true);
+      document.addEventListener('keyup', (e) => handle(e, false), true);
+    }
+
+    function initializeApp() {
+      isDisplay = isDisplayMode();
+      isControlsOnly = isControlsOnlyMode();
+      loadPersisted();
+      const fromParam = getRomFromParams();
+      if (fromParam) { romUrl = fromParam; persistRomUrl(); }
+      if (!romUrl) { romUrl = DEFAULT_ROM_URL; persistRomUrl(); }
+
+      if (isControlsOnly) {
+        // Controls-only popout window
+        bindPopupControls();
+        openChannel();
+        showControlsPopup();
+      } else if (isDisplay) {
+        showDisplay();
+        bindPopupControls();
+        // Keep canvas focused for keyboard controls
+        try {
+          const c = getCanvasEl();
+          if (c) {
+            c.addEventListener('pointerdown', () => { try { c.focus(); } catch (e) {} });
+            c.addEventListener('touchstart', () => { try { c.focus(); } catch (e) {} }, { passive: true });
+          }
+        } catch (e) {}
+        openChannel();
+        if (channel) {
+          channel.onmessage = (event) => {
+            const data = event.data || {};
+            if (typeof data.romUrl === 'string') {
+              romUrl = data.romUrl.trim();
+              persistRomUrl();
+              initAndPlay(romUrl);
+            } else if (data && data.type === 'control') {
+              const code = data.code || '';
+              const key = data.key || '';
+              const type = data.down ? 'keydown' : 'keyup';
+              synthesizeKey(code, key, type);
+            }
+          };
+        }
+        // Start if we already have a ROM URL
+        if (romUrl) initAndPlay(romUrl);
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'visible' && romUrl) initAndPlay(romUrl);
+        });
+      } else {
+        showConfig();
+        bindPopupControls();
+        setupConfigUI();
+      }
+      // Enable keyboard shortcuts in all modes
+      bindKeyboardShortcuts();
+    }
+
+    document.addEventListener('DOMContentLoaded', initializeApp);
+  </script>
+</body>
+
+</html>
+
+
